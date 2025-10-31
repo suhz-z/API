@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pytesseract
+PyMuPDF
+Pillow
+pandas
+openpyxl
+tqdm
+numpy
