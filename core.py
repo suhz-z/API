@@ -5,6 +5,11 @@ import io, re, os
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
+
+
 
 # config
 DPI = 400
@@ -135,20 +140,22 @@ def process_voter_pdf(pdf_bytes, house_no_input, mode):
     doc = fitz.open(temp_pdf)
     collected, all_voters = [], []
 
-    for page_idx in tqdm(range(1, len(doc)), desc="📄 Pages", unit="page"):
-        page = doc.load_page(page_idx)
-        prefix = house_no_input.split("/")[0] + "/"
-        if prefix not in page.get_text():
-            continue
+    def process_page(page_idx):
+        results_local = []
+        crops_local = []
+        try:
+            page = doc.load_page(page_idx)
+            prefix = house_no_input.split("/")[0] + "/"
+            if prefix not in page.get_text():
+                return [], []
 
-        pix = page.get_pixmap(dpi=DPI)
-        img = Image.open(io.BytesIO(pix.tobytes("png")))
-        img_arr = np.array(img)
-        rects = [d["rect"] for d in page.get_drawings() if d.get("rect")]
-        scale = DPI / 72.0
+            pix = page.get_pixmap(dpi=DPI)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            img_arr = np.array(img)
+            rects = [d["rect"] for d in page.get_drawings() if d.get("rect")]
+            scale = DPI / 72.0
 
-        for rect_index, r in enumerate(rects):
-            try:
+            for rect_index, r in enumerate(rects):
                 x0, y0, x1, y1 = int(r.x0 * scale), int(r.y0 * scale), int(r.x1 * scale), int(r.y1 * scale)
                 full_crop = img_arr[y0:y1, x0:x1]
                 sub_crop = full_crop[:, :int(full_crop.shape[1] * 0.5)]
@@ -157,7 +164,6 @@ def process_voter_pdf(pdf_bytes, house_no_input, mode):
                 if house_no_input not in matches:
                     continue
 
-                # Crop value area
                 width, height = r.x1 - r.x0, r.y1 - r.y0
                 value_area = fitz.Rect(r.x0 + width * 0.26, r.y0, r.x1 - width * 0.2, r.y1)
                 pix_val = page.get_pixmap(clip=value_area, dpi=DPI)
@@ -168,8 +174,7 @@ def process_voter_pdf(pdf_bytes, house_no_input, mode):
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
                 voter_id, name, relation, house_no, house_name, gender_age = parse_voter_lines(lines, pix_val)
 
-
-                all_voters.append({
+                results_local.append({
                     "VoterID": voter_id,
                     "Name": name,
                     "Relation": relation,
@@ -179,11 +184,20 @@ def process_voter_pdf(pdf_bytes, house_no_input, mode):
                     "Page": page_idx + 1,
                     "RectIndex": rect_index,
                 })
+                crops_local.append(full_crop)
+        except Exception as e:
+            print(f"[Page {page_idx}] Error: {e}")
+        return results_local, crops_local
 
-                collected.append(full_crop)
 
-            except Exception as e:
-                print(f"[Page {page_idx} | Rect {rect_index}] Error: {e}")
+    # Run in parallel threads
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(process_page, i): i for i in range(1, len(doc))}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="🔄 OCR Pages", unit="page"):
+            res, crops = future.result()
+            all_voters.extend(res)
+            collected.extend(crops)
+
 
 
 
@@ -193,8 +207,35 @@ def process_voter_pdf(pdf_bytes, house_no_input, mode):
     results = {}
     if mode == "xlsx":
         xlsx_path = os.path.join(OUTPUT_DIR, f"voter_data_{house_no_input.replace('/', '-')}.xlsx")
-        pd.DataFrame(all_voters).to_excel(xlsx_path, index=False, engine="openpyxl")
+
+        # Save temp images + record their paths
+        image_paths = []
+        for idx, crop in enumerate(collected):
+            img_path = os.path.join(OUTPUT_DIR, f"voter_{house_no_input.replace('/', '-')}_{idx+1}.png")
+            Image.fromarray(crop).save(img_path)
+            image_paths.append(img_path)
+
+        # Combine data with image path column
+        df = pd.DataFrame(all_voters)
+        df.insert(0, "Image", image_paths)  # new first column
+        df.to_excel(xlsx_path, index=False, engine="openpyxl")
+
+        # Embed images into Excel cells
+        wb = load_workbook(xlsx_path)
+        ws = wb.active
+        for i, img_path in enumerate(image_paths, start=2):  # header row is 1
+            try:
+                img = XLImage(img_path)
+                img.height = 90
+                img.width = 120
+                ws.row_dimensions[i].height = 70
+                ws.add_image(img, f"A{i}")  # insert in column A
+            except Exception as e:
+                print(f"Failed to embed image for row {i}: {e}")
+
+        wb.save(xlsx_path)
         results["xlsx"] = xlsx_path
+
     elif mode == "pdf":
         pdf_path = os.path.join(OUTPUT_DIR, f"filtered_{house_no_input.replace('/', '-')}.pdf")
         save_filtered_pdf(collected, pdf_path)

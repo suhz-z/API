@@ -16,9 +16,9 @@ def delete_file(path: str):
     try:
         if os.path.exists(path):
             os.remove(path)
-            print(f"🧹 Deleted temp file: {path}")
+            print(f" Deleted temp file: {path}")
     except Exception as e:
-        print(f"⚠️ Error deleting {path}: {e}")
+        print(f" Error deleting {path}: {e}")
 
 
 @app.post("/process")
