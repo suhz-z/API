@@ -12,7 +12,7 @@ from openpyxl.drawing.image import Image as XLImage
 # config
 DPI = 400
 HOUSE_RE = re.compile(r"(\d{1,3}\s*/\s*\d{1,4})")
-TESSERACT_CONFIG = r"--oem 3 --psm 6"
+TESSERACT_CONFIG = r"--oem 3 --psm 6 -c preserve_interword_spaces=1"
 
 
 def ocr_malayalam(pixmap):
@@ -136,6 +136,11 @@ def save_filtered_xlsx_in_memory(collected, all_voters):
         ws.add_image(xl_img, f"A{i}")
         for j, value in enumerate(row, start=2):
             ws.cell(row=i, column=j, value=str(value))
+
+    ws.freeze_panes = "B2"
+    for col in ws.columns:
+        ws.column_dimensions[col[0].column_letter].width = 20
+
 
     xlsx_stream = io.BytesIO()
     wb.save(xlsx_stream)

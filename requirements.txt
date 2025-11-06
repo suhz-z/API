@@ -1,9 +1,12 @@
+
 fastapi
 uvicorn
 pytesseract
-PyMuPDF
 Pillow
+numpy
+PyMuPDF  
+pdf2image
 pandas
 openpyxl
 tqdm
-numpy
+python-multipart  
