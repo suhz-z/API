@@ -1,4 +1,4 @@
-import fitz 
+import fitz
 import pytesseract
 from PIL import Image
 import io, re, os
@@ -6,19 +6,13 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from openpyxl import load_workbook
+from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
-
-
 
 # config
 DPI = 400
-OUTPUT_DIR = "output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 HOUSE_RE = re.compile(r"(\d{1,3}\s*/\s*\d{1,4})")
 TESSERACT_CONFIG = r"--oem 3 --psm 6"
-
 
 
 def ocr_malayalam(pixmap):
@@ -27,11 +21,9 @@ def ocr_malayalam(pixmap):
     img = img.point(lambda x: 0 if x < 165 else 255, "1")  # binarize
 
     text = pytesseract.image_to_string(img, lang="mal+eng", config=TESSERACT_CONFIG)
-
     text = re.sub(r"[^0-9A-Za-z\u0D00-\u0D7F/\s]", "", text)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-   
     if lines:
         top_crop = img.crop((0, 0, img.width, int(img.height * 0.18)))
         id_text = pytesseract.image_to_string(
@@ -52,7 +44,6 @@ def parse_voter_lines(lines, pixmap=None):
     while len(lines) < 6:
         lines.append("")
 
-   
     voter_id = ""
     id_match = re.search(r"[A-Z0-9/]{5,}", "".join(lines))
     if id_match:
@@ -66,31 +57,24 @@ def parse_voter_lines(lines, pixmap=None):
 
     relation = re.sub(r"^(വ്‌|വ്|\u0D35\u0D4D\u200C)", "", relation).strip()
 
-    
     if len(lines) > 4:
         if not re.search(r"\d{1,3}", lines[4]):
             house_name = lines[4].strip()
             if len(lines) > 5 and not re.search(r"\d{1,3}", lines[5]):
                 house_name += " " + lines[5].strip()
 
-    # OCR last line again (Malayalam only) for gender
     if pixmap is not None:
         img = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("L")
         h = img.height
-        last_line_crop = img.crop((0, int(h * 0.82), img.width, h))  # bottom ~18%
-
-        # Malayalam OCR
+        last_line_crop = img.crop((0, int(h * 0.82), img.width, h))
         mal_text = pytesseract.image_to_string(last_line_crop, lang="mal", config="--psm 7")
         mal_text = re.sub(r"[^0-9A-Za-z\u0D00-\u0D7F/\s]", "", mal_text).strip()
-
-        # English OCR - age 
         eng_text = pytesseract.image_to_string(last_line_crop, lang="eng", config="--psm 7")
         age_match = re.search(r"(\d{2,3})", eng_text)
         age_str = age_match.group(1) if age_match else ""
 
-        
         if re.search(r"\d{2,3}", mal_text):
-            gender_age = mal_text  
+            gender_age = mal_text
         else:
             gender_age = mal_text
             if age_str:
@@ -99,9 +83,8 @@ def parse_voter_lines(lines, pixmap=None):
     return voter_id, name, relation, house_no, house_name, gender_age
 
 
-
-def save_filtered_pdf(collected, output_path):
-    """Save filtered voter boxes as 2x10 grid PDF."""
+def save_filtered_pdf_in_memory(collected):
+    """Save filtered voter boxes to a PDF in memory."""
     out_doc = fitz.open()
     page_width, page_height = 595, 842
     boxes_per_row, boxes_per_page = 2, 20
@@ -127,22 +110,46 @@ def save_filtered_pdf(collected, output_path):
         else:
             x_pt += voter_width
 
-    out_doc.save(output_path)
+    pdf_stream = io.BytesIO()
+    out_doc.save(pdf_stream)
     out_doc.close()
+    pdf_stream.seek(0)
+    return pdf_stream.getvalue()
+
+
+def save_filtered_xlsx_in_memory(collected, all_voters):
+    """Save Excel with embedded images in memory."""
+    df = pd.DataFrame(all_voters)
+    wb = Workbook()
+    ws = wb.active
+
+    # Write headers
+    ws.append(["Image"] + list(df.columns))
+
+    for i, (row, crop) in enumerate(zip(df.itertuples(index=False), collected), start=2):
+        img_buffer = io.BytesIO()
+        Image.fromarray(crop).save(img_buffer, format="PNG")
+        img_buffer.seek(0)
+        xl_img = XLImage(img_buffer)
+        xl_img.width, xl_img.height = 120, 90
+        ws.row_dimensions[i].height = 70
+        ws.add_image(xl_img, f"A{i}")
+        for j, value in enumerate(row, start=2):
+            ws.cell(row=i, column=j, value=str(value))
+
+    xlsx_stream = io.BytesIO()
+    wb.save(xlsx_stream)
+    xlsx_stream.seek(0)
+    return xlsx_stream.getvalue()
 
 
 def process_voter_pdf(pdf_bytes, house_no_input, mode):
-    """Core logic used by FastAPI to filter voters."""
-    temp_pdf = os.path.join(OUTPUT_DIR, "temp_input.pdf")
-    with open(temp_pdf, "wb") as f:
-        f.write(pdf_bytes)
-
-    doc = fitz.open(temp_pdf)
+    """Core logic used by FastAPI to filter voters (in-memory version)."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     collected, all_voters = [], []
 
     def process_page(page_idx):
-        results_local = []
-        crops_local = []
+        results_local, crops_local = [], []
         try:
             page = doc.load_page(page_idx)
             prefix = house_no_input.split("/")[0] + "/"
@@ -189,57 +196,21 @@ def process_voter_pdf(pdf_bytes, house_no_input, mode):
             print(f"[Page {page_idx}] Error: {e}")
         return results_local, crops_local
 
-
-    # Run in parallel threads
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(process_page, i): i for i in range(1, len(doc))}
+        futures = {executor.submit(process_page, i): i for i in range(len(doc))}
         for future in tqdm(as_completed(futures), total=len(futures), desc="🔄 OCR Pages", unit="page"):
             res, crops = future.result()
             all_voters.extend(res)
             collected.extend(crops)
 
-
-
+    doc.close()
 
     if not collected:
         raise Exception(f"No matching voters found for house number {house_no_input}")
 
-    results = {}
-    if mode == "xlsx":
-        xlsx_path = os.path.join(OUTPUT_DIR, f"voter_data_{house_no_input.replace('/', '-')}.xlsx")
-
-        # Save temp images + record their paths
-        image_paths = []
-        for idx, crop in enumerate(collected):
-            img_path = os.path.join(OUTPUT_DIR, f"voter_{house_no_input.replace('/', '-')}_{idx+1}.png")
-            Image.fromarray(crop).save(img_path)
-            image_paths.append(img_path)
-
-        # Combine data with image path column
-        df = pd.DataFrame(all_voters)
-        df.insert(0, "Image", image_paths)  # new first column
-        df.to_excel(xlsx_path, index=False, engine="openpyxl")
-
-        # Embed images into Excel cells
-        wb = load_workbook(xlsx_path)
-        ws = wb.active
-        for i, img_path in enumerate(image_paths, start=2):  # header row is 1
-            try:
-                img = XLImage(img_path)
-                img.height = 90
-                img.width = 120
-                ws.row_dimensions[i].height = 70
-                ws.add_image(img, f"A{i}")  # insert in column A
-            except Exception as e:
-                print(f"Failed to embed image for row {i}: {e}")
-
-        wb.save(xlsx_path)
-        results["xlsx"] = xlsx_path
-
-    elif mode == "pdf":
-        pdf_path = os.path.join(OUTPUT_DIR, f"filtered_{house_no_input.replace('/', '-')}.pdf")
-        save_filtered_pdf(collected, pdf_path)
-        results["pdf"] = pdf_path
-
-    doc.close()
-    return results
+    if mode == "pdf":
+        return {"pdf_bytes": save_filtered_pdf_in_memory(collected)}
+    elif mode == "xlsx":
+        return {"xlsx_bytes": save_filtered_xlsx_in_memory(collected, all_voters)}
+    else:
+        raise ValueError("Invalid output mode.")
